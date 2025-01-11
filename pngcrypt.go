@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/crypto/pbkdf2"
+	"github.com/awnumar/memguard"
 	"image"
 	"image/color"
 	"image/png"
@@ -49,11 +50,12 @@ func bytesToImage(data []byte) (image.Image, error) {
 	return png.Decode(bytes.NewReader(data))
 }
 
-func deriveKey(password string, salt []byte) []byte {
-	return pbkdf2.Key([]byte(password), salt, iterations, keySize, sha256.New)
+func deriveKey(password *memguard.LockedBuffer, salt []byte) (*memguard.LockedBuffer, error) {
+	key := pbkdf2.Key(password.Bytes(), salt, iterations, keySize, sha256.New)
+	return memguard.NewBufferFromBytes(key), nil
 }
 
-func encryptImage(img image.Image, password string) (image.Image, error) {
+func encryptImage(img image.Image, password *memguard.LockedBuffer) (image.Image, error) {
 	imgData, err := imageToBytes(img)
 	if err != nil {
 		return nil, err
@@ -64,8 +66,13 @@ func encryptImage(img image.Image, password string) (image.Image, error) {
 		return nil, err
 	}
 
-	key := deriveKey(password, salt)
-	block, err := aes.NewCipher(key)
+	keyBuffer, err := deriveKey(password, salt)
+	if err != nil {
+		return nil, err
+	}
+	defer keyBuffer.Destroy()
+
+	block, err := aes.NewCipher(keyBuffer.Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +89,6 @@ func encryptImage(img image.Image, password string) (image.Image, error) {
 
 	ciphertext := aead.Seal(nil, nonce, imgData.Raw, nil)
 
-	// Store length + salt + nonce + ciphertext
 	dataLen := uint32(len(ciphertext) + saltSize + nonceSize)
 	lenBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBytes, dataLen)
@@ -109,7 +115,7 @@ func encryptImage(img image.Image, password string) (image.Image, error) {
 	return noiseImg, nil
 }
 
-func decryptImage(noiseImg image.Image, password string) (image.Image, error) {
+func decryptImage(noiseImg image.Image, password *memguard.LockedBuffer) (image.Image, error) {
 	bounds := noiseImg.Bounds()
 	size := bounds.Max.X
 	rawData := make([]byte, size*size*3)
@@ -126,14 +132,19 @@ func decryptImage(noiseImg image.Image, password string) (image.Image, error) {
 	}
 
 	dataLen := binary.BigEndian.Uint32(rawData[:4])
-	data := rawData[4:dataLen+4]
+	data := rawData[4 : dataLen+4]
 
 	salt := data[:saltSize]
 	nonce := data[saltSize : saltSize+nonceSize]
 	ciphertext := data[saltSize+nonceSize:]
 
-	key := deriveKey(password, salt)
-	block, err := aes.NewCipher(key)
+	keyBuffer, err := deriveKey(password, salt)
+	if err != nil {
+		return nil, err
+	}
+	defer keyBuffer.Destroy()
+
+	block, err := aes.NewCipher(keyBuffer.Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -152,49 +163,55 @@ func decryptImage(noiseImg image.Image, password string) (image.Image, error) {
 }
 
 func main() {
-    decrypt := flag.Bool("d", false, "Decrypt mode")
-    password := flag.String("p", "", "Password for encryption/decryption")
-    flag.Parse()
+	memguard.CatchInterrupt()
+	defer memguard.Purge()
 
-    if *password == "" {
-        fmt.Println("Please provide password with -p")
-        flag.PrintDefaults()
-        return
-    }
+	decrypt := flag.Bool("d", false, "Decrypt mode")
+	passwordFlag := flag.String("p", "", "Password for encryption/decryption")
+	flag.Parse()
 
-    if *decrypt {
-        noiseImg, err := png.Decode(os.Stdin)
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "Error decoding encrypted image: %v\n", err)
-            return
-        }
+	if *passwordFlag == "" {
+		fmt.Println("Please provide a password with -p")
+		flag.PrintDefaults()
+		return
+	}
 
-        decryptedImg, err := decryptImage(noiseImg, *password)
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "Decryption failed: %v\n", err)
-            return
-        }
+	password := memguard.NewBufferFromBytes([]byte(*passwordFlag))
+	defer password.Destroy()
 
-        if err := png.Encode(os.Stdout, decryptedImg); err != nil {
-            fmt.Fprintf(os.Stderr, "Error encoding PNG: %v\n", err)
-            return
-        }
-    } else {
-        img, err := png.Decode(os.Stdin)
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "Error decoding PNG: %v\n", err)
-            return
-        }
+	if *decrypt {
+		noiseImg, err := png.Decode(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error decoding encrypted image: %v\n", err)
+			return
+		}
 
-        encryptedImg, err := encryptImage(img, *password)
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "Encryption failed: %v\n", err)
-            return
-        }
+		decryptedImg, err := decryptImage(noiseImg, password)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Decryption failed: %v\n", err)
+			return
+		}
 
-        if err := png.Encode(os.Stdout, encryptedImg); err != nil {
-            fmt.Fprintf(os.Stderr, "Error encoding encrypted PNG: %v\n", err)
-            return
-        }
-    }
+		if err := png.Encode(os.Stdout, decryptedImg); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding PNG: %v\n", err)
+			return
+		}
+	} else {
+		img, err := png.Decode(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error decoding PNG: %v\n", err)
+			return
+		}
+
+		encryptedImg, err := encryptImage(img, password)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Encryption failed: %v\n", err)
+			return
+		}
+
+		if err := png.Encode(os.Stdout, encryptedImg); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding encrypted PNG: %v\n", err)
+			return
+		}
+	}
 }
