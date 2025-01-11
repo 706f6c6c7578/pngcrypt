@@ -1,2 +1,2 @@
 # pngcrypt
-pngcrypt - Encrypt/decrypt .png images
+pngcrypt - Encrypt/decrypt .png images.
